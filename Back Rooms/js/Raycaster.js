@@ -1,11 +1,12 @@
-import { hash2i, hash32, rand01FromI } from "./ChunkedMap.js";
+import { HALF_WALL_THICKNESS, hash2i, hash32, rand01FromI } from "./ChunkedMap.js";
 export class Raycaster {
-    constructor(scene, w, h, textures, mapAccessor, roomAccessor = null) {
+    constructor(scene, w, h, textures, mapAccessor, roomAccessor = null, holeAccessor = null) {
         this.scene = scene;
         this.w = w;
         this.h = h;
         this.mapAccessor = mapAccessor;
         this.roomAccessor = roomAccessor;
+        this.holeAccessor = holeAccessor;
 
         this.canvas = document.createElement('canvas');
         this.canvas.width = w;
@@ -13,11 +14,10 @@ export class Raycaster {
         this.ctx = this.canvas.getContext('2d', { alpha: false });
         this.imageData = this.ctx.createImageData(w, h);
         this.buf = this.imageData.data;
-        // optional entity cache (filled from MainScene once available)
-        this.entityPx = null;
-        this.entityW = 0;
-        this.entityH = 0;
+        // Animation frames are filled from MainScene after textures load.
+        this.entityAnimations = {};
         this.grimeCache = new Map();
+        this.vhsScratch = new Uint8ClampedArray(this.buf.length);
 
         this.texWall = textures.wall;
         this.texFloor = textures.floor;
@@ -35,7 +35,7 @@ export class Raycaster {
         this.sprite = scene.add.image(0, 0, 'view').setOrigin(0, 0);
         this.sprite.setScrollFactor(0);
 
-        this.fogColor = { r: 11, g: 15, b: 20 };
+        this.fogColor = { r: 22, g: 23, b: 18 };
     }
 
     _readPixels(img) {
@@ -181,13 +181,15 @@ export class Raycaster {
         const falloffRadius = inLargeRoom ? 1.45 : 1.35;
         const falloff = Math.max(0, 1 - distance / falloffRadius);
 
-        // Near-black ambient light makes each fluorescent panel its own pool
-        // instead of allowing neighboring fixtures to wash the whole map.
-        return 0.012 + Math.pow(falloff, 2.15) * 1.48 * power;
+        // Keep shadowed corridors readable while preserving distinct pools
+        // beneath the fluorescent fixtures.
+        return 0.12 + Math.pow(falloff, 2.15) * 1.42 * power;
     }
 
     _ceilingFixture(wx, wy, u, v) {
-        const inLargeRoom = this.roomAccessor?.(wx, wy, 0) || false;
+        // Match _localLight's room margin exactly so every generated light
+        // pool has a visible ceiling fixture on the same grid.
+        const inLargeRoom = this.roomAccessor?.(wx, wy, 1) || false;
         const spacingX = 2;
         const spacingY = inLargeRoom ? 2 : 3;
         const gridX = ((wx % spacingX) + spacingX) % spacingX;
@@ -205,8 +207,91 @@ export class Raycaster {
         return inLamp ? 2 : 1;
     }
 
+    _applyVhsOverlay(timeMs = 0) {
+        const w = this.w;
+        const h = this.h;
+        const source = this.vhsScratch;
+        source.set(this.buf);
+
+        const frame = Math.floor(timeMs / 33);
+        const trackingY = ((timeMs * 0.045) % (h + 80)) - 40;
+
+        for (let y = 0; y < h; y++) {
+            const rowHash = hash32(frame ^ Math.imul(y + 1, 0x45d9f3b));
+            const heavyJitter = (rowHash & 255) < 5;
+            const jitter = heavyJitter
+                ? ((rowHash >>> 8) % 7) - 3
+                : ((rowHash >>> 8) % 3) - 1;
+            const trackingDistance = Math.abs(y - trackingY);
+            const trackingGain = trackingDistance < 2
+                ? 1.24
+                : trackingDistance < 7 ? 1.08 : 1;
+            const scanline = y % 3 === 0 ? 0.92 : 1;
+
+            for (let x = 0; x < w; x++) {
+                const greenX = Phaser.Math.Clamp(x + jitter, 0, w - 1);
+                const redX = Phaser.Math.Clamp(greenX + 1, 0, w - 1);
+                const blueX = Phaser.Math.Clamp(greenX - 1, 0, w - 1);
+                const redIndex = (y * w + redX) * 4;
+                const greenIndex = (y * w + greenX) * 4;
+                const blueIndex = (y * w + blueX) * 4;
+                const index = (y * w + x) * 4;
+
+                const noiseHash = hash32(
+                    frame ^
+                    Math.imul(x + 1, 73856093) ^
+                    Math.imul(y + 1, 19349663)
+                );
+                const noise = ((noiseHash >>> 24) / 255 - 0.5) * 15;
+                const nx = (x / (w - 1)) * 2 - 1;
+                const ny = (y / (h - 1)) * 2 - 1;
+                const vignette = Math.max(0.78, 1 - (nx * nx + ny * ny) * 0.1);
+                const gain = 1.1 * scanline * trackingGain * vignette;
+
+                this.buf[index] = source[redIndex] * gain + noise + 2;
+                this.buf[index + 1] = source[greenIndex + 1] * gain + noise;
+                this.buf[index + 2] = source[blueIndex + 2] * gain + noise + 4;
+                this.buf[index + 3] = 255;
+            }
+        }
+    }
+
+    _applyFallOverlay(amount = 0) {
+        if (amount <= 0) return;
+        const darkness = Math.max(0, 1 - amount * 1.12);
+        const centerX = this.w * 0.5;
+        const centerY = this.h * 0.72;
+        const maxDistance = Math.hypot(centerX, centerY);
+        for (let y = 0; y < this.h; y++) {
+            for (let x = 0; x < this.w; x++) {
+                const index = (y * this.w + x) * 4;
+                const radial = Math.hypot(x - centerX, y - centerY) / maxDistance;
+                const edgeFade = Math.max(0, 1 - amount * radial * 1.8);
+                const gain = darkness * edgeFade;
+                this.buf[index] *= gain;
+                this.buf[index + 1] *= gain;
+                this.buf[index + 2] *= gain;
+            }
+        }
+    }
+
+    _applyExitOverlay(amount = 0) {
+        if (amount <= 0) return;
+        const glowR = 205;
+        const glowG = 255;
+        const glowB = 211;
+        for (let index = 0; index < this.buf.length; index += 4) {
+            this.buf[index] = this.buf[index] * (1 - amount) + glowR * amount;
+            this.buf[index + 1] = this.buf[index + 1] * (1 - amount) + glowG * amount;
+            this.buf[index + 2] = this.buf[index + 2] * (1 - amount) + glowB * amount;
+        }
+    }
+
     render(state) {
-        const { posX, posY, dirX, dirY, planeX, planeY, pitch, light } = state;
+        const {
+            posX, posY, dirX, dirY, planeX, planeY,
+            pitch, light, time = 0, fallAmount = 0, exitAmount = 0
+        } = state;
         const w = this.w, h = this.h;
         const halfH = (h / 2) | 0;
         const horizon = (halfH + pitch) | 0;
@@ -285,6 +370,15 @@ export class Raycaster {
                     }
                 }
 
+                if (isFloor && rowDist < 18 && this.holeAccessor?.(floorX, floorY)) {
+                    // A nearly black opening with a faint cool tone reads as
+                    // depth rather than a painted square on the carpet.
+                    const depthNoise = this._smoothRandom(floorX * 3, floorY * 3, 0x484F4C45);
+                    r = 1 + depthNoise * 3;
+                    g = 2 + depthNoise * 4;
+                    b = 4 + depthNoise * 6;
+                }
+
                 ;[r, g, b] = this._mixFog(r, g, b, rowDist);
 
                 const idx = (y * w + x) * 4;
@@ -298,34 +392,46 @@ export class Raycaster {
         /* -------------------------
            WALLS LAST (so visible)
         -------------------------- */
+        // Sub-tile DDA lets map cells contain thin vertical or horizontal
+        // walls while preserving the classic fast grid raycast.
+        const rayCellSize = HALF_WALL_THICKNESS;
         for (let x = 0; x < w; x++) {
             const cameraX = 2 * x / w - 1;
             const rayDirX = dirX + planeX * cameraX;
             const rayDirY = dirY + planeY * cameraX;
+            const gridRayDirX = rayDirX / rayCellSize;
+            const gridRayDirY = rayDirY / rayCellSize;
 
-            let mapX = posX | 0;
-            let mapY = posY | 0;
+            const gridPosX = posX / rayCellSize;
+            const gridPosY = posY / rayCellSize;
+            let mapX = Math.floor(gridPosX);
+            let mapY = Math.floor(gridPosY);
 
-            const deltaDistX = rayDirX === 0 ? 1e30 : Math.abs(1 / rayDirX);
-            const deltaDistY = rayDirY === 0 ? 1e30 : Math.abs(1 / rayDirY);
+            const deltaDistX = gridRayDirX === 0 ? 1e30 : Math.abs(1 / gridRayDirX);
+            const deltaDistY = gridRayDirY === 0 ? 1e30 : Math.abs(1 / gridRayDirY);
 
             let stepX, stepY, sideDistX, sideDistY;
-            if (rayDirX < 0) { stepX = -1; sideDistX = (posX - mapX) * deltaDistX; }
-            else { stepX = 1; sideDistX = (mapX + 1 - posX) * deltaDistX; }
-            if (rayDirY < 0) { stepY = -1; sideDistY = (posY - mapY) * deltaDistY; }
-            else { stepY = 1; sideDistY = (mapY + 1 - posY) * deltaDistY; }
+            if (gridRayDirX < 0) { stepX = -1; sideDistX = (gridPosX - mapX) * deltaDistX; }
+            else { stepX = 1; sideDistX = (mapX + 1 - gridPosX) * deltaDistX; }
+            if (gridRayDirY < 0) { stepY = -1; sideDistY = (gridPosY - mapY) * deltaDistY; }
+            else { stepY = 1; sideDistY = (mapY + 1 - gridPosY) * deltaDistY; }
 
             let hit = 0, side = 0;
             let guard = 0;
             while (!hit && guard++ < 512) {
                 if (sideDistX < sideDistY) { sideDistX += deltaDistX; mapX += stepX; side = 0; }
                 else { sideDistY += deltaDistY; mapY += stepY; side = 1; }
-                if (this.mapAccessor(mapX, mapY) > 0) hit = 1;
+                const sampleX = (mapX + 0.5) * rayCellSize;
+                const sampleY = (mapY + 0.5) * rayCellSize;
+                if (this.mapAccessor(sampleX, sampleY)) hit = 1;
             }
             if (!hit) continue;
             let perpWallDist;
-            if (side === 0) perpWallDist = (mapX - posX + (1 - stepX) / 2) / rayDirX;
-            else perpWallDist = (mapY - posY + (1 - stepY) / 2) / rayDirY;
+            if (side === 0) {
+                perpWallDist = (mapX - gridPosX + (1 - stepX) / 2) / gridRayDirX;
+            } else {
+                perpWallDist = (mapY - gridPosY + (1 - stepY) / 2) / gridRayDirY;
+            }
             this.zBuffer[x] = perpWallDist;
 
 
@@ -382,10 +488,48 @@ export class Raycaster {
         // Draw every billboard once, from farthest to nearest, after the wall
         // depth buffer is complete so props occlude one another correctly.
         const billboards = [];
-        if (this.entityPx && state.entity?.active) {
+        for (const entity of state.entities || []) {
+            if (!entity.active) continue;
+            const animation = this.entityAnimations[entity.type];
+            if (!animation?.frames.length) continue;
+            const elapsedFrames = Math.floor(
+                time * 0.001 * entity.animationFps + entity.animationPhase
+            );
+            const frame = animation.frames[
+                ((elapsedFrames % animation.frames.length) + animation.frames.length) %
+                animation.frames.length
+            ];
             billboards.push({
-                px: this.entityPx, w: this.entityW, h: this.entityH,
-                x: state.entity.x, y: state.entity.y, scale: 1
+                px: frame.px, w: frame.w, h: frame.h,
+                x: entity.x,
+                y: entity.y,
+                scale: entity.scale * (state.entityGroupScale ?? 1)
+            });
+        }
+        if (this.exitSprites?.portal && state.exit) {
+            const sprite = this.exitSprites.portal;
+            billboards.push({
+                px: sprite.px, w: sprite.w, h: sprite.h,
+                x: state.exit.x, y: state.exit.y,
+                scale: 1.08,
+                emissive: true
+            });
+        }
+        for (const sign of state.exitSigns || []) {
+            const toExitX = sign.targetX - sign.x;
+            const toExitY = sign.targetY - sign.y;
+            const forward = dirX * toExitX + dirY * toExitY;
+            const right = dirY * toExitX - dirX * toExitY;
+            const direction = forward > Math.abs(right) * 0.7
+                ? 'forward'
+                : right >= 0 ? 'right' : 'left';
+            const sprite = this.exitSprites?.[direction];
+            if (!sprite) continue;
+            billboards.push({
+                px: sprite.px, w: sprite.w, h: sprite.h,
+                x: sign.x, y: sign.y,
+                scale: sign.scale,
+                emissive: true
             });
         }
         for (const prop of state.props || []) {
@@ -404,16 +548,21 @@ export class Raycaster {
         for (const billboard of billboards) {
             this.drawBillboard(
                 billboard.px, billboard.w, billboard.h,
-                billboard.x, billboard.y, state, billboard.scale
+                billboard.x, billboard.y, state, billboard.scale,
+                billboard.emissive || false
             );
         }
+
+        this._applyVhsOverlay(time);
+        this._applyFallOverlay(fallAmount);
+        this._applyExitOverlay(exitAmount);
 
         // commit
         this.ctx.putImageData(this.imageData, 0, 0);
         this.out.draw(0, 0, this.canvas);
         this.out.refresh();
     }
-    drawBillboard(spritePx, sw, sh, entX, entY, state, scale = 1) {
+    drawBillboard(spritePx, sw, sh, entX, entY, state, scale = 1, emissive = false) {
         const { posX, posY, dirX, dirY, planeX, planeY, pitch, light } = state;
         const w = this.w, h = this.h;
         const horizon = ((h / 2) | 0) + (pitch | 0);
@@ -455,7 +604,9 @@ export class Raycaster {
         const fogK = Math.min(1, dist / 16);
         const flash = 1.0; // if you later add flashlight, multiply here
         const localLight = this._localLight(entX, entY, light);
-        const shadeBase = (0.95 / (1.0 + dist * 0.10)) * localLight * flash;
+        const shadeBase = emissive
+            ? Math.max(0.62, 1.05 / (1.0 + dist * 0.035))
+            : (0.95 / (1.0 + dist * 0.10)) * localLight * flash;
 
         for (let stripe = drawStartX; stripe <= drawEndX; stripe++) {
             // occlusion test per column
@@ -499,4 +650,3 @@ export class Raycaster {
     }
 
 }
-

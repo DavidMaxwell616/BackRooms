@@ -10,7 +10,23 @@ export function hash2i(x, y, seed = 1337) {
 }
 export function rand01FromI(i) { return ((i >>> 0) / 4294967296); }
 export function rand01(x, y, seed = 1337) { return rand01FromI(hash2i(x, y, seed)); }
-// 0 = empty, 1 = wall
+// Tile geometry:
+// 0 = empty, 1 = full wall
+// 2/3 = vertical half wall on the left/right side of the tile
+// 4/5 = horizontal half wall on the top/bottom side of the tile
+// 6 = open square hole in the floor
+export const TILE = Object.freeze({
+    EMPTY: 0,
+    WALL: 1,
+    HALF_VERTICAL_LEFT: 2,
+    HALF_VERTICAL_RIGHT: 3,
+    HALF_HORIZONTAL_TOP: 4,
+    HALF_HORIZONTAL_BOTTOM: 5,
+    HOLE: 6
+});
+export const HALF_WALL_THICKNESS = 0.25;
+export const HOLE_INSET = 0.1;
+
 const PREFABS = {
     HALL_NS: [
         "11111",
@@ -68,6 +84,7 @@ export class ChunkedMap {
 
         this.cache = new Map(); // key -> { data: Uint8Array, touched: number }
         this.roomCache = new Map();
+        this.exitLocation = null;
         this.tick = 0;
 
         // knobs
@@ -116,6 +133,11 @@ export class ChunkedMap {
     }
 
     getCell(wx, wy) {
+        const tile = this.getTile(wx, wy);
+        return tile === TILE.EMPTY || tile === TILE.HOLE ? 0 : 1;
+    }
+
+    getTile(wx, wy) {
         const { cx, cy, lx, ly } = this.worldToChunkCell(wx, wy);
         const k = this.key(cx, cy);
         let chunk = this.cache.get(k);
@@ -123,7 +145,118 @@ export class ChunkedMap {
             chunk = { data: this.generateChunk(cx, cy), touched: this.tick };
             this.cache.set(k, chunk);
         }
-        return chunk.data[ly * this.chunkSize + lx] ? 1 : 0;
+        return chunk.data[ly * this.chunkSize + lx];
+    }
+
+    isSolidAt(wx, wy) {
+        const cellX = Math.floor(wx);
+        const cellY = Math.floor(wy);
+        const tile = this.getTile(cellX, cellY);
+        if (tile === TILE.EMPTY || tile === TILE.HOLE) return false;
+        if (tile === TILE.WALL) return true;
+
+        const localX = wx - cellX;
+        const localY = wy - cellY;
+        switch (tile) {
+            case TILE.HALF_VERTICAL_LEFT: return localX < HALF_WALL_THICKNESS;
+            case TILE.HALF_VERTICAL_RIGHT: return localX >= 1 - HALF_WALL_THICKNESS;
+            case TILE.HALF_HORIZONTAL_TOP: return localY < HALF_WALL_THICKNESS;
+            case TILE.HALF_HORIZONTAL_BOTTOM: return localY >= 1 - HALF_WALL_THICKNESS;
+            default: return false;
+        }
+    }
+
+    isHoleAt(wx, wy, inset = HOLE_INSET) {
+        const cellX = Math.floor(wx);
+        const cellY = Math.floor(wy);
+        if (this.getTile(cellX, cellY) !== TILE.HOLE) return false;
+        const localX = wx - cellX;
+        const localY = wy - cellY;
+        return localX >= inset && localX <= 1 - inset &&
+            localY >= inset && localY <= 1 - inset;
+    }
+
+    getExit() {
+        if (this.exitLocation) return this.exitLocation;
+
+        const directions = [
+            [1, 0], [1, 1], [0, 1], [-1, 1],
+            [-1, 0], [-1, -1], [0, -1], [1, -1]
+        ];
+        const exitHash = hash32(this.seed ^ 0x45584954);
+        const [directionX, directionY] = directions[(exitHash >>> 0) % directions.length];
+        const distance = 2 + ((exitHash >>> 5) & 1);
+        const chunkX = directionX * distance;
+        const chunkY = directionY * distance;
+        const rooms = this.getLargeRooms(chunkX, chunkY);
+        const room = rooms[(exitHash >>> 8) % rooms.length];
+        const candidates = [
+            [
+                Math.floor((room.left + room.right) * 0.5) + 0.5,
+                Math.floor((room.top + room.bottom) * 0.5) + 0.5
+            ],
+            [room.left + 1.5, room.top + 1.5],
+            [room.right - 0.5, room.bottom - 0.5]
+        ];
+
+        let localX = (this.chunkSize / 2 | 0) + 0.5;
+        let localY = (this.chunkSize / 2 | 0) + 0.5;
+        for (const [candidateX, candidateY] of candidates) {
+            const worldX = chunkX * this.chunkSize + candidateX;
+            const worldY = chunkY * this.chunkSize + candidateY;
+            if (!this.isSolidAt(worldX, worldY) && !this.isHoleAt(worldX, worldY)) {
+                localX = candidateX;
+                localY = candidateY;
+                break;
+            }
+        }
+
+        this.exitLocation = {
+            x: chunkX * this.chunkSize + localX,
+            y: chunkY * this.chunkSize + localY,
+            chunkX,
+            chunkY
+        };
+        return this.exitLocation;
+    }
+
+    isExitAt(wx, wy, radius = 0.62) {
+        const exit = this.getExit();
+        return Math.hypot(wx - exit.x, wy - exit.y) <= radius;
+    }
+
+    getExitSignsAround(posX, posY, radius = 34) {
+        const cs = this.chunkSize;
+        const minChunkX = Math.floor((posX - radius) / cs);
+        const maxChunkX = Math.floor((posX + radius) / cs);
+        const minChunkY = Math.floor((posY - radius) / cs);
+        const maxChunkY = Math.floor((posY + radius) / cs);
+        const exit = this.getExit();
+        const signs = [];
+
+        for (let cy = minChunkY; cy <= maxChunkY; cy++) {
+            for (let cx = minChunkX; cx <= maxChunkX; cx++) {
+                const signHash = hash2i(cx, cy, this.seed ^ 0x5349474E);
+                const offset = 2 + ((signHash >>> 8) % (cs - 4));
+                const vertical = (signHash & 1) === 0;
+                const localX = vertical ? (cs / 2 | 0) + 0.5 : offset + 0.5;
+                const localY = vertical ? offset + 0.5 : (cs / 2 | 0) + 0.5;
+                const x = cx * cs + localX;
+                const y = cy * cs + localY;
+
+                if (Math.hypot(x - posX, y - posY) > radius) continue;
+                if (Math.hypot(x - exit.x, y - exit.y) < 2) continue;
+                if (this.isSolidAt(x, y) || this.isHoleAt(x, y)) continue;
+                signs.push({
+                    id: `${cx},${cy}:exit-sign`,
+                    x, y,
+                    targetX: exit.x,
+                    targetY: exit.y,
+                    scale: 0.95
+                });
+            }
+        }
+        return signs;
     }
 
     getLargeRooms(cx, cy) {
@@ -179,6 +312,7 @@ export class ChunkedMap {
         const maxChunkX = Math.floor((posX + radius) / cs);
         const minChunkY = Math.floor((posY - radius) / cs);
         const maxChunkY = Math.floor((posY + radius) / cs);
+        const exit = this.getExit();
         const decorations = [];
 
         for (let cy = minChunkY; cy <= maxChunkY; cy++) {
@@ -197,6 +331,7 @@ export class ChunkedMap {
                             : (room.top + 1.5) + (room.bottom - room.top - 2) * t;
                         const x = cx * cs + localX;
                         const y = cy * cs + localY;
+                        if (Math.hypot(x - exit.x, y - exit.y) < 1.35) continue;
                         if (Math.hypot(x - posX, y - posY) <= radius + 3) {
                             decorations.push({
                                 id: `${cx},${cy}:${room.index}:${item}`,
@@ -271,6 +406,33 @@ export class ChunkedMap {
             for (let y = room.top; y <= room.bottom; y++) {
                 carveHorizontal(y, room.left, room.right);
             }
+
+            // Cut one doorway through a horizontal wall and one through a
+            // vertical wall. Each opening is one tile wide and has no door.
+            const roomSeed = hash32(seed ^ Math.imul(room.index + 1, 0x45d9f3b));
+            const doorX = Math.min(
+                room.right - 1,
+                room.left + 1 + ((roomSeed >>> 0) % Math.max(1, room.right - room.left - 1))
+            );
+            const doorY = Math.min(
+                room.bottom - 1,
+                room.top + 1 + ((hash32(roomSeed ^ 0x444F4F52) >>> 0) %
+                    Math.max(1, room.bottom - room.top - 1))
+            );
+            const opensTop = (roomSeed & 1) === 0;
+            const opensLeft = (roomSeed & 2) === 0;
+            const horizontalWallY = opensTop ? room.top - 1 : room.bottom + 1;
+            const verticalWallX = opensLeft ? room.left - 1 : room.right + 1;
+            carveVertical(
+                doorX,
+                opensTop ? horizontalWallY - 1 : horizontalWallY,
+                opensTop ? horizontalWallY : horizontalWallY + 1
+            );
+            carveHorizontal(
+                doorY,
+                opensLeft ? verticalWallX - 1 : verticalWallX,
+                opensLeft ? verticalWallX : verticalWallX + 1
+            );
         }
 
         // Join every prefab cell with a continuous, snake-shaped hallway.
@@ -296,8 +458,91 @@ export class ChunkedMap {
         carveHorizontal(mid, 0, cs - 1);
         carveVertical(mid, 0, cs - 1);
 
+        // Turn selected exposed full-wall cells into half-tile walls. The
+        // occupied half remains attached to its solid neighbor, preventing
+        // isolated floating slivers while adding both wall orientations.
+        const source = data.slice();
+        const verticalCandidates = [];
+        const horizontalCandidates = [];
+        const sourceAt = (x, y) => source[y * cs + x];
+        for (let y = 1; y < cs - 1; y++) {
+            for (let x = 1; x < cs - 1; x++) {
+                if (sourceAt(x, y) !== TILE.WALL) continue;
+
+                const leftWall = sourceAt(x - 1, y) === TILE.WALL;
+                const rightWall = sourceAt(x + 1, y) === TILE.WALL;
+                const topWall = sourceAt(x, y - 1) === TILE.WALL;
+                const bottomWall = sourceAt(x, y + 1) === TILE.WALL;
+
+                if (leftWall !== rightWall) {
+                    verticalCandidates.push({
+                        x, y,
+                        tile: leftWall ? TILE.HALF_VERTICAL_LEFT : TILE.HALF_VERTICAL_RIGHT
+                    });
+                }
+                if (topWall !== bottomWall) {
+                    horizontalCandidates.push({
+                        x, y,
+                        tile: topWall ? TILE.HALF_HORIZONTAL_TOP : TILE.HALF_HORIZONTAL_BOTTOM
+                    });
+                }
+            }
+        }
+
+        const placeHalfWalls = (candidates, salt) => {
+            candidates.sort((a, b) =>
+                (hash32(seed ^ salt ^ (a.x * 73856093 ^ a.y * 19349663)) >>> 0) -
+                (hash32(seed ^ salt ^ (b.x * 73856093 ^ b.y * 19349663)) >>> 0)
+            );
+            const count = Math.min(candidates.length, Math.max(1, Math.floor(candidates.length * 0.12)));
+            let placed = 0;
+            for (const candidate of candidates) {
+                const index = candidate.y * cs + candidate.x;
+                if (data[index] !== TILE.WALL) continue;
+                data[index] = candidate.tile;
+                if (++placed >= count) break;
+            }
+        };
+        placeHalfWalls(verticalCandidates, 0x56455254);
+        placeHalfWalls(horizontalCandidates, 0x484F5249);
+
+        // Place one square floor opening in a clear corner of a large room.
+        // Keeping a full floor tile around it makes the edge readable and
+        // leaves enough room for the player to approach from every side.
+        const holeCandidates = [];
+        for (const room of this.getLargeRooms(cx, cy)) {
+            const corners = [
+                [room.left + 1, room.top + 1],
+                [room.right - 1, room.top + 1],
+                [room.right - 1, room.bottom - 1],
+                [room.left + 1, room.bottom - 1]
+            ];
+            const start = hash32(seed ^ 0x484F4C45 ^ room.index) & 3;
+            for (let offset = 0; offset < corners.length; offset++) {
+                const [x, y] = corners[(start + offset) & 3];
+                let clear = true;
+                for (let oy = -1; oy <= 1 && clear; oy++) {
+                    for (let ox = -1; ox <= 1; ox++) {
+                        if (data[(y + oy) * cs + x + ox] !== TILE.EMPTY) {
+                            clear = false;
+                            break;
+                        }
+                    }
+                }
+                if (clear) {
+                    holeCandidates.push({ x, y, roomIndex: room.index });
+                    break;
+                }
+            }
+        }
+        if (holeCandidates.length) {
+            const hole = holeCandidates[
+                (hash32(seed ^ 0x0B07704D) >>> 0) % holeCandidates.length
+            ];
+            data[hole.y * cs + hole.x] = TILE.HOLE;
+        }
+
         return data;
     }
 
 }
-
